@@ -133,6 +133,8 @@ class SDRClassifier(Serializable):
     # these so that we can associate the current iteration's classification
     # with the activationPattern from N steps ago
     self._patternNZHistory = deque(maxlen=self._maxSteps)
+    self._patternNZHistoryLearn = deque(maxlen=self._maxSteps)
+    self.argsBuf = deque(maxlen=self._maxSteps)
 
     # This contains the value of the highest input number we've ever seen
     # It is used to pre-allocate fixed size arrays that hold the weights
@@ -157,6 +159,12 @@ class SDRClassifier(Serializable):
     # Set the version to the latest version.
     # This is used for serialization/deserialization
     self._version = SDRClassifier.VERSION
+
+  def computeBuf(self):
+      if len(self.argsBuf) < self._maxSteps:
+          return
+      self.compute(self.argsBuf[0][0], self.argsBuf[0][1], self.argsBuf[0][2], True, self.argsBuf[0][4])
+
 
 
   def compute(self, recordNum, patternNZ, classification, learn, infer):
@@ -203,6 +211,10 @@ class SDRClassifier(Serializable):
                      'actualValues': [1.5, 3,5, 5,5, 7.6],
                    }
     """
+    if not learn:
+     self.argsBuf.append([recordNum, patternNZ, classification, learn, infer])
+    #print patternNZ
+    #self.verbosity = 2
     if self.verbosity >= 1:
       print "  learn:", learn
       print "  recordNum:", recordNum
@@ -210,14 +222,24 @@ class SDRClassifier(Serializable):
       print "  classificationIn:", classification
 
     # ensures that recordNum increases monotonically
-    if len(self._patternNZHistory) > 0:
-      if recordNum < self._patternNZHistory[-1][0]:
-        raise ValueError("the record number has to increase monotonically")
+    if not learn:
+        if len(self._patternNZHistory) > 0:
+          if recordNum < self._patternNZHistory[-1][0]:
+            raise ValueError("the record number has to increase monotonically")
 
-    # Store pattern in our history if this is a new record
-    if len(self._patternNZHistory) == 0 or \
-                    recordNum > self._patternNZHistory[-1][0]:
-      self._patternNZHistory.append((recordNum, patternNZ))
+        # Store pattern in our history if this is a new record
+        if len(self._patternNZHistory) == 0 or \
+                        recordNum > self._patternNZHistory[-1][0]:
+          self._patternNZHistory.append((recordNum, patternNZ))
+    if learn:
+        if len(self._patternNZHistoryLearn) > 0:
+          if recordNum < self._patternNZHistoryLearn[-1][0]:
+            raise ValueError("the record number has to increase monotonically")
+
+        # Store pattern in our history if this is a new record
+        if len(self._patternNZHistoryLearn) == 0 or \
+                        recordNum > self._patternNZHistoryLearn[-1][0]:
+          self._patternNZHistoryLearn.append((recordNum, patternNZ))
 
     # To allow multi-class classification, we need to be able to run learning
     # without inference being on. So initialize retval outside
@@ -256,8 +278,11 @@ class SDRClassifier(Serializable):
     if infer:
       retval = self.infer(patternNZ, actValueList)
 
-
+    #print recordNum
+    # if recordNum > 500:
+    #   learn = False
     if learn and classification["bucketIdx"] is not None:
+
       for categoryI in range(numCategory):
         bucketIdx = bucketIdxList[categoryI]
         actValue = actValueList[categoryI]
@@ -288,9 +313,9 @@ class SDRClassifier(Serializable):
                                              + self.actValueAlpha * actValue)
           else:
             self._actualValues[bucketIdx] = actValue
+      for (learnRecordNum, learnPatternNZ) in self._patternNZHistoryLearn:
 
-      for (learnRecordNum, learnPatternNZ) in self._patternNZHistory:
-        error = self._calculateError(recordNum, bucketIdxList)
+        error = self._calculateError(recordNum, bucketIdxList, learn)
 
         nSteps = recordNum - learnRecordNum
         if nSteps in self.steps:
@@ -307,6 +332,7 @@ class SDRClassifier(Serializable):
           continue
         print "    %d steps: " % (nSteps), _pFormatArray(votes)
         bestBucketIdx = votes.argmax()
+        print ("bkts", len(votes))
         print ("      most likely bucket idx: "
                "%d, value: %s" % (bestBucketIdx,
                                   retval["actualValues"][bestBucketIdx]))
@@ -391,7 +417,7 @@ class SDRClassifier(Serializable):
 
     classifier.alpha = proto.alpha
     classifier.actValueAlpha = proto.actValueAlpha
-
+    print "READ"
     classifier._patternNZHistory = deque(maxlen=max(classifier.steps) + 1)
 
     patternNZHistoryProto = proto.patternNZHistory
@@ -426,6 +452,7 @@ class SDRClassifier(Serializable):
 
 
   def write(self, proto):
+    print "WRITE"
     stepsProto = proto.init("steps", len(self.steps))
     for i in xrange(len(self.steps)):
       stepsProto[i] = self.steps[i]
@@ -474,7 +501,7 @@ class SDRClassifier(Serializable):
     proto.verbosity = self.verbosity
 
 
-  def _calculateError(self, recordNum, bucketIdxList):
+  def _calculateError(self, recordNum, bucketIdxList, learn=False):
     """
     Calculate error signal
 
@@ -488,13 +515,20 @@ class SDRClassifier(Serializable):
     numCategories = len(bucketIdxList)
     for bucketIdx in bucketIdxList:
       targetDist[bucketIdx] = 1.0/numCategories
-
-    for (learnRecordNum, learnPatternNZ) in self._patternNZHistory:
-      nSteps = recordNum - learnRecordNum
-      if nSteps in self.steps:
-        predictDist = self.inferSingleStep(learnPatternNZ,
-                                           self._weightMatrix[nSteps])
-        error[nSteps] = targetDist - predictDist
+    if not learn:
+        for (learnRecordNum, learnPatternNZ) in self._patternNZHistory:
+          nSteps = recordNum - learnRecordNum
+          if nSteps in self.steps:
+            predictDist = self.inferSingleStep(learnPatternNZ,
+                                               self._weightMatrix[nSteps])
+            error[nSteps] = targetDist - predictDist
+    else:
+        for (learnRecordNum, learnPatternNZ) in self._patternNZHistoryLearn:
+              nSteps = recordNum - learnRecordNum
+              if nSteps in self.steps:
+                predictDist = self.inferSingleStep(learnPatternNZ,
+                                                   self._weightMatrix[nSteps])
+                error[nSteps] = targetDist - predictDist
 
     return error
 
